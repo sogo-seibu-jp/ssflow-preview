@@ -108,6 +108,7 @@ const ROW_RULE_ACTIONS = [
   { value: "last-token", labelKey: "rules.action.lastToken" },
   { value: "index-token", labelKey: "rules.action.indexToken" },
   { value: "first-nonempty", labelKey: "rules.action.firstNonEmpty" },
+  { value: "merge", labelKey: "rules.action.merge" },
 ];
 const FUNCTION_FIELD_NAMES = {
   [`${MAPPING_FUNCTION_PREFIX}today_yyyy_mm_dd`]: "YYYY/MM/DD",
@@ -116,7 +117,8 @@ const FUNCTION_FIELD_NAMES = {
 const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/svg+xml", "image/webp"]);
 const IMAGE_FILE_EXTENSIONS = new Set(["jpg", "jpeg", "png", "svg", "webp"]);
 const MAX_UPLOAD_BYTES = 3 * 1024 * 1024;
-const APP_VERSION = "v1.5008";
+const APP_VERSION = "v1.6001";
+const DEFAULT_LINE_HEIGHT = 1.15;
 const RESIZE_HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
 const SNAP_GRID_SIZE = 8;
 const SNAP_THRESHOLD = 6;
@@ -173,7 +175,17 @@ const defaultStyle = {
   textRotation: 0,
   color: "#000000",
   backgroundColor: "transparent",
-  autoFit: true,
+  // New fields wrap by default. Templates saved before this release carry no
+  // `wrap` property at all, so they stay on the single-line path and their
+  // printed output does not move.
+  wrap: true,
+  lineHeight: DEFAULT_LINE_HEIGHT,
+  render: "text",
+  codabarStartStop: "A",
+  // `autoFit` used to sit here and was read by nothing. Removed so that a
+  // future shrink-to-fit feature is not wired to a property every template in
+  // production already carries set to true -- that would switch shrinking on
+  // for all of them at once. Use a new property; do NOT migrate this one.
 };
 
 const defaultLayout = {
@@ -1952,6 +1964,10 @@ function App() {
     }
     const printableRows = getPrintableRowEntries(activeCsv, selectedRowIds);
     const records = expandRowEntries(printableRows.length ? printableRows : [{ row: {}, index: 0 }], rowCopies).map((entry) => entry.row);
+    // Absent on every template saved before this release, so placement maths
+    // stays on the legacy path unless a template explicitly opts in.
+    const baselineMode = activeTemplate.baselineMode === "metric" ? "metric" : "legacy";
+    const barcodeErrors = new Set();
     let outputPage = outputDoc.addPage([printMetrics.paper.width, printMetrics.paper.height]);
     records.forEach((row, index) => {
       const slot = index % printMetrics.slotsPerPage;
@@ -1964,7 +1980,12 @@ function App() {
       activeTemplate.variables.forEach((variable) => {
         const source = activeMapping[variable.id];
         const value = resolveMappedValue(source, row, activeTemplate.rules ?? [], variable.key);
-        const text = String(value !== "" ? value : variable.displayName ?? "");
+        // Default stays as it always was: an empty value falls back to the field
+        // name, which is how staff spot bad data on a nametag. Fields that opt in
+        // print nothing instead -- needed for continuation slips, where the ID and
+        // barcode cells are legitimately blank.
+        const emptyFallback = variable.blankWhenEmpty ? "" : (variable.displayName ?? "");
+        const text = String(value !== "" ? value : emptyFallback);
         const drawFont = variable.style.fontWeight === "bold" ? boldFont : regularFont;
         const textRotation = normalizeTextRotation(variable.style.textRotation);
         const box = {
@@ -1973,11 +1994,6 @@ function App() {
           width: variable.widthRatio * printMetrics.itemWidth,
           height: variable.heightRatio * printMetrics.itemHeight,
         };
-        // The size set in the field config is the size that prints. Text is never
-        // wrapped and never shrunk to fit: a value too long for its box overflows
-        // rather than silently changing size.
-        const size = Math.max(4, variable.style.fontSize * printMetrics.variableScale);
-        const textWidth = drawFont.widthOfTextAtSize(text, size);
         if (variable.style.backgroundColor && variable.style.backgroundColor !== "transparent") {
           outputPage.drawRectangle({
             x: box.x,
@@ -1987,14 +2003,58 @@ function App() {
             color: hexToRgb(variable.style.backgroundColor),
           });
         }
-        const textOrigin = rotatedTextOrigin(box, textWidth, size, variable.style.textAlign, variable.style.verticalAlign, textRotation);
-        outputPage.drawText(text, {
-          x: textOrigin.x,
-          y: textOrigin.y,
-          size,
-          font: drawFont,
-          rotate: degrees(pdfTextRotation(textRotation)),
-          color: hexToRgb(variable.style.color),
+        if (!text) return;
+        const size = Math.max(4, variable.style.fontSize * printMetrics.variableScale);
+        const textColor = hexToRgb(variable.style.color);
+
+        if ((variable.style.render ?? "text") === "codabar") {
+          const drawn = drawCodabarBarcode(outputPage, box, text, variable.style.codabarStartStop, textColor);
+          if (!drawn.ok && drawn.error === "charset") barcodeErrors.add(variable.displayName || variable.key);
+          return;
+        }
+
+        // Multi-line and metric placement are opt-in, and rotated text keeps the
+        // original path untouched. A single-line, unwrapped, legacy-baseline field
+        // therefore runs exactly the code it always did and prints identically.
+        const wrapEnabled = Boolean(variable.style.wrap);
+        const useBlockPath = textRotation === 0
+          && (wrapEnabled || baselineMode === "metric" || text.includes("\n"));
+        if (!useBlockPath) {
+          const textWidth = drawFont.widthOfTextAtSize(text, size);
+          const textOrigin = rotatedTextOrigin(box, textWidth, size, variable.style.textAlign, variable.style.verticalAlign, textRotation);
+          outputPage.drawText(text, {
+            x: textOrigin.x,
+            y: textOrigin.y,
+            size,
+            font: drawFont,
+            rotate: degrees(pdfTextRotation(textRotation)),
+            color: textColor,
+          });
+          return;
+        }
+
+        const lines = layoutTextLines(text, drawFont, size, box.width, wrapEnabled);
+        const lineGap = size * clampNumber(Number(variable.style.lineHeight) || DEFAULT_LINE_HEIGHT, 0.5, 3);
+        // One line's ink extent. Legacy keeps the old assumption (extent ===
+        // fontSize, baseline at the bottom of it) so nothing moves; metric uses the
+        // font's real ascent and descent.
+        const extentHeight = textExtentHeight(size, baselineMode);
+        const blockExtent = (lines.length - 1) * lineGap + extentHeight;
+        const widest = lines.reduce((max, line) => Math.max(max, drawFont.widthOfTextAtSize(line, size)), 0);
+        const origin = rotatedTextOrigin(box, widest, blockExtent, variable.style.textAlign, variable.style.verticalAlign, 0);
+        const firstBaseline = origin.y + blockExtent - extentHeight + baselineOffsetWithin(size, baselineMode);
+        const alignPosition = TEXT_ALIGN_POSITION[variable.style.textAlign] ?? "center";
+        lines.forEach((line, index) => {
+          if (!line) return;
+          const lineWidth = drawFont.widthOfTextAtSize(line, size);
+          outputPage.drawText(line, {
+            x: placeExtent(box.x, box.width, lineWidth, alignPosition),
+            y: firstBaseline - index * lineGap,
+            size,
+            font: drawFont,
+            rotate: degrees(0),
+            color: textColor,
+          });
         });
       });
     });
@@ -2002,7 +2062,9 @@ function App() {
     if (exportUrl) URL.revokeObjectURL(exportUrl);
     const nextUrl = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
     setExportUrl(nextUrl);
-    setStatus(t("status.printablePdfGenerated"));
+    setStatus(barcodeErrors.size
+      ? t("status.barcodeInvalid", { fields: Array.from(barcodeErrors).join(", ") })
+      : t("status.printablePdfGenerated"));
     if (openAfter) {
       const printWindow = window.open(nextUrl, "_blank");
       if (printWindow) {
@@ -2276,6 +2338,10 @@ function RulesPage({ rules: ruleList, setRules, t }) {
       action: draft.action || "last-token",
       tokenIndex: Number(draft.tokenIndex ?? 0) || 0,
       fallback: draft.fallback || "",
+      sourceHeaders: String(draft.sourceHeadersText ?? "")
+        .split(",")
+        .map((header) => header.trim())
+        .filter(Boolean),
     };
     const alreadyExists = !editingId && rules.some((rule) => ruleSignature(rule) === ruleSignature(nextRule));
     const nextRules = editingId
@@ -2318,6 +2384,7 @@ function RulesPage({ rules: ruleList, setRules, t }) {
                   action: rule.action || "last-token",
                   tokenIndex: rule.tokenIndex ?? 0,
                   fallback: rule.fallback || "",
+                  sourceHeadersText: (Array.isArray(rule.sourceHeaders) ? rule.sourceHeaders : []).join(", "),
                 });
               }}
             >
@@ -2344,6 +2411,7 @@ function RulesPage({ rules: ruleList, setRules, t }) {
               <option value="space">{t("rules.delimiter.space")}</option>
               <option value="comma">{t("rules.delimiter.comma")}</option>
               <option value="dot">{t("rules.delimiter.dot")}</option>
+              <option value="newline">{t("rules.delimiter.newline")}</option>
               <option value="custom">{t("rules.delimiter.custom")}</option>
             </select>
           </label>
@@ -2361,6 +2429,17 @@ function RulesPage({ rules: ruleList, setRules, t }) {
               ))}
             </select>
           </label>
+          {draft.action === "merge" ? (
+            <label>
+              {t("rules.sourceHeaders")}
+              <input
+                value={draft.sourceHeadersText}
+                placeholder={t("rules.sourceHeadersPlaceholder")}
+                onChange={(event) => setDraft((current) => ({ ...current, sourceHeadersText: event.target.value }))}
+              />
+              <small className="muted">{t("rules.sourceHeadersHelp")}</small>
+            </label>
+          ) : null}
           {draft.action === "index-token" ? (
             <label>
               {t("rules.tokenIndex")}
@@ -2402,6 +2481,7 @@ function createEmptyRule() {
     action: "last-token",
     tokenIndex: 0,
     fallback: "",
+    sourceHeadersText: "",
   };
 }
 
@@ -2437,6 +2517,14 @@ function TemplatePackagePage({ workMode, language, templates, templatePreviewUrl
                 value={template.templateName}
                 onChange={(event) => updateTemplate(template.templateId, { templateName: event.target.value })}
               />
+              <label className="template-baseline-toggle">
+                <input
+                  type="checkbox"
+                  checked={template.baselineMode === "metric"}
+                  onChange={(event) => updateTemplate(template.templateId, { baselineMode: event.target.checked ? "metric" : "legacy" })}
+                />
+                <span>{t("templates.baselineMetric")}</span>
+              </label>
               <div className="template-row-actions">
                 <button onClick={() => exportTemplateFile(template.templateId)}>
                   <ArrowDownToLine size={16} /> {t("button.saveTemplatePackage")}
@@ -3267,6 +3355,10 @@ function TemplateCanvas({
                 textAlign={variable.style.textAlign}
                 verticalAlign={variable.style.verticalAlign}
                 sizeKey={variable.style.fontSize}
+                wrap={Boolean(variable.style.wrap)}
+                lineHeight={variable.style.lineHeight}
+                render={variable.style.render}
+                codabarStartStop={variable.style.codabarStartStop}
               />
               {editable && selectedVariableId === variable.id && selectedVariableIds.length <= 1 && RESIZE_HANDLES.map((mode) => (
                 <span
@@ -3364,6 +3456,50 @@ function VariableEditor({ variable, mappingSource, updateVariableSource, updateV
       </div>
       <div className="swatch-row">
         <label>{t("field.textColor")}<input type="color" value={variable.style.color} onChange={(event) => updateVariableStyle({ color: event.target.value })} /></label>
+        <label>
+          {t("field.render")}
+          <select className="ui-select" value={variable.style.render ?? "text"} onChange={(event) => updateVariableStyle({ render: event.target.value })}>
+            <option value="text">{t("field.render.text")}</option>
+            <option value="codabar">{t("field.render.codabar")}</option>
+          </select>
+        </label>
+        {(variable.style.render ?? "text") === "codabar" ? (
+          <label>
+            {t("field.codabarStartStop")}
+            <select className="ui-select" value={variable.style.codabarStartStop ?? "A"} onChange={(event) => updateVariableStyle({ codabarStartStop: event.target.value })}>
+              <option value="A">A</option>
+              <option value="B">B</option>
+              <option value="C">C</option>
+              <option value="D">D</option>
+            </select>
+            <small className="muted">{t("field.codabarHelp")}</small>
+          </label>
+        ) : (
+          <>
+            <label className="check">
+              <input type="checkbox" checked={Boolean(variable.style.wrap)} onChange={(event) => updateVariableStyle({ wrap: event.target.checked })} />
+              <span>{t("field.wrap")}</span>
+            </label>
+            {variable.style.wrap ? (
+              <label>
+                {t("field.lineHeight")}
+                <input
+                  type="number"
+                  min="0.5"
+                  max="3"
+                  step="0.05"
+                  value={Number(variable.style.lineHeight ?? DEFAULT_LINE_HEIGHT)}
+                  onChange={(event) => updateVariableStyle({ lineHeight: Number(event.target.value) || DEFAULT_LINE_HEIGHT })}
+                />
+                <small className="muted">{t("field.lineHeightHelp")}</small>
+              </label>
+            ) : null}
+          </>
+        )}
+        <label className="check">
+          <input type="checkbox" checked={Boolean(variable.blankWhenEmpty)} onChange={(event) => updateVariable({ blankWhenEmpty: event.target.checked })} />
+          <span>{t("field.blankWhenEmpty")}</span>
+        </label>
         <div className="bg-color-control">
           <span>{t("field.boxBackground")}</span>
           <div className="bg-color-row">
@@ -4967,6 +5103,10 @@ function PaperTemplateSlot({ template, cropImageUrl, previewValues, style, fontS
               textAlign={variable.style.textAlign}
               verticalAlign={variable.style.verticalAlign}
               sizeKey={renderedSize}
+              wrap={Boolean(variable.style.wrap)}
+              lineHeight={variable.style.lineHeight}
+              render={variable.style.render}
+              codabarStartStop={variable.style.codabarStartStop}
             />
           </div>
           );
@@ -5384,6 +5524,10 @@ function ruleSignature(rule) {
     Number(rule?.tokenIndex ?? 0) || 0,
     rule?.fallback ?? "",
     rule?.sourceHeader ?? "",
+    // A merge rule differs from another only by its column list, so it has to
+    // be in the signature. Without it dedupeRules collapses two different
+    // merges and remapRuleSources rewrites every mapping onto the survivor.
+    Array.isArray(rule?.sourceHeaders) ? rule.sourceHeaders : [],
   ]);
 }
 
@@ -5457,6 +5601,9 @@ function resolveMappedValue(source, row, rules = [], sourceHeader = "") {
     const ruleId = String(source).replace(RULE_SOURCE_PREFIX, "");
     const rule = rules.find((item) => item.id === ruleId) ?? null;
     if (!rule) return "";
+    // Merge reads several columns instead of transforming one, so it runs
+    // before the single-header extractor path below.
+    if (rule.action === "merge") return mergeRuleValue(rule, row);
     const resolvedHeader = String(sourceHeader || rule.sourceHeader || "").trim();
     const rawValue = resolvedHeader ? (row?.[resolvedHeader] ?? "") : "";
     const text = rawValue === undefined || rawValue === null ? "" : String(rawValue);
@@ -5469,6 +5616,25 @@ function resolveMappedValue(source, row, rules = [], sourceHeader = "") {
   if (source === `${MAPPING_FUNCTION_PREFIX}today_yyyy_mm_dd`) return formatTodayDate("yyyy/mm/dd");
   if (source === `${MAPPING_FUNCTION_PREFIX}today_yyyymmdd`) return formatTodayDate("yyyymmdd");
   return "";
+}
+
+// "newline" is what lets a merge build a stacked address block without a line
+// break ever having to live inside a CSV cell.
+function ruleJoinText(rule) {
+  if (rule?.delimiter === "custom") return rule.customDelimiter ?? "";
+  if (rule?.delimiter === "comma") return ",";
+  if (rule?.delimiter === "dot") return ".";
+  if (rule?.delimiter === "newline") return "\n";
+  return " ";
+}
+
+function mergeRuleValue(rule, row) {
+  const headers = Array.isArray(rule?.sourceHeaders) ? rule.sourceHeaders : [];
+  const parts = headers
+    .map((header) => String(row?.[String(header).trim()] ?? "").trim())
+    .filter(Boolean);
+  if (!parts.length) return rule?.fallback || "";
+  return parts.join(ruleJoinText(rule));
 }
 
 function applyRuleToValue(value, rule) {
@@ -5940,13 +6106,34 @@ function buildButtonTooltip(label, t) {
   return `Click to ${text.toLowerCase()}.`;
 }
 
-// The preview fits from the rendered element rather than from a crop size in
-// points: getCropPointSize returns null whenever a template has no stored page
-// size, which silently disabled shrinking everywhere it was used. offsetWidth is
-// a layout value, so the scale transform never feeds back into the measurement.
-//
-// This is the same ratio the export computes (box extent / text advance width)
-// with the same font, so preview and PDF shrink by the same amount.
+// Draws the same module pattern the exporter draws, so the designer shows real
+// bars that can be checked against the box rather than a placeholder.
+function BarcodePreview({ value, startStop, className }) {
+  const prepared = prepareCodabarValue(value, startStop);
+  if (!prepared.ok) {
+    return <span className={`${className ?? ""} barcode-preview-error`.trim()}>{value}</span>;
+  }
+  const modules = codabarModules(prepared.chars);
+  const totalUnits = modules.reduce((sum, module) => sum + module.units, 0) || 1;
+  return (
+    <span className={`${className ?? ""} barcode-preview`.trim()}>
+      {modules.map((module, index) => (
+        <i
+          key={index}
+          style={{
+            width: `${(module.units / totalUnits) * 100}%`,
+            background: module.bar ? "currentColor" : "transparent",
+          }}
+        />
+      ))}
+    </span>
+  );
+}
+
+// Places rotated text in the previews. (An earlier comment here described a
+// shrink-to-fit ratio shared with the export; neither this component nor the
+// export has shrunk text for some time, so it has been removed rather than left
+// to mislead the next reader.)
 function PaperVariableText({
   text,
   rotation = 0,
@@ -5954,6 +6141,10 @@ function PaperVariableText({
   verticalAlign = "middle",
   className = "paper-variable-text",
   sizeKey = 0,
+  wrap = false,
+  lineHeight = DEFAULT_LINE_HEIGHT,
+  render = "text",
+  codabarStartStop = "A",
 }) {
   const ref = useRef(null);
   const fontsReady = useWebFontsReady();
@@ -6010,8 +6201,28 @@ function PaperVariableText({
     observer.observe(box);
     return () => observer.disconnect();
   }, [text, rotation, textAlign, verticalAlign, sizeKey, fontsReady]);
+  if (render === "codabar") {
+    return <BarcodePreview value={text} startStop={codabarStartStop} className={className} />;
+  }
+  // Only unrotated text wraps, matching the exporter.
+  const wrapping = wrap && !normalizeTextRotation(rotation);
   return (
-    <span ref={ref} className={className} style={{ transform: `rotate(${rotation}deg)` }}>
+    <span
+      ref={ref}
+      className={className}
+      style={{
+        transform: `rotate(${rotation}deg)`,
+        ...(wrapping
+          ? {
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
+            wordBreak: "break-all",
+            width: "100%",
+            lineHeight: String(Number(lineHeight) || DEFAULT_LINE_HEIGHT),
+          }
+          : null),
+      }}
+    >
       {text}
     </span>
   );
@@ -6107,6 +6318,171 @@ function rotatedTextOrigin(box, textWidth, textHeight, textAlign, verticalAlign,
   if (normalized === 180) return { x: left + textWidth, y: bottom + textHeight };
   if (normalized === 270) return { x: left + textHeight, y: bottom };
   return { x: left, y: bottom };
+}
+
+// --- Text metrics -----------------------------------------------------------
+// Noto Sans CJK JP is the only family bundled in public/fonts. Its OS/2
+// sTypoAscender is 880 and sTypoDescender -120 at unitsPerEm 1000: the
+// ideographic em box, which is the ink a full-width glyph actually occupies and
+// so the thing a field box should line up with. (hhea ascent/descent, 1160/-288,
+// describe line spacing and would overshoot a box by a quarter of an em.)
+const CJK_ASCENT_EM = 0.88;
+const CJK_DESCENT_EM = 0.12;
+
+// Legacy placement treats fontSize as the entire character height and hands the
+// result to pdf-lib as the BASELINE, so text lands low and bottom-aligned
+// descenders drop out of the box. Templates without `baselineMode` stay on it,
+// because every one of them was positioned by eye against that behaviour.
+function textExtentHeight(size, baselineMode) {
+  return baselineMode === "metric" ? (CJK_ASCENT_EM + CJK_DESCENT_EM) * size : size;
+}
+
+function baselineOffsetWithin(size, baselineMode) {
+  return baselineMode === "metric" ? CJK_DESCENT_EM * size : 0;
+}
+
+// --- Wrapping ---------------------------------------------------------------
+// widthOfTextAtSize runs a full font layout per call, and wrapping asks for one
+// per character inside the per-record export loop. Widths are linear in size, so
+// each glyph is measured once at 1000 and scaled. Kerning is ignored here, which
+// only ever shifts a break point by a fraction of a glyph; the line widths used
+// for alignment are measured properly below.
+const glyphWidthCache = new WeakMap();
+
+function measuredCharWidth(font, char, size) {
+  let perFont = glyphWidthCache.get(font);
+  if (!perFont) {
+    perFont = new Map();
+    glyphWidthCache.set(font, perFont);
+  }
+  let unit = perFont.get(char);
+  if (unit === undefined) {
+    try {
+      unit = font.widthOfTextAtSize(char, 1000);
+    } catch {
+      unit = 500;
+    }
+    perFont.set(char, unit);
+  }
+  return (unit / 1000) * size;
+}
+
+// Greedy wrap. Japanese has no word spaces, so a break is allowed between any two
+// characters; a Latin run prefers the last space instead of splitting the word.
+function wrapTextToWidth(text, font, size, maxWidth) {
+  if (!text) return [""];
+  if (!(maxWidth > 0)) return [text];
+  const lines = [];
+  let line = "";
+  let width = 0;
+  let spaceAt = -1;
+  Array.from(text).forEach((char) => {
+    const charWidth = measuredCharWidth(font, char, size);
+    if (line && width + charWidth > maxWidth) {
+      if (spaceAt > 0 && spaceAt < line.length) {
+        lines.push(line.slice(0, spaceAt).replace(/\s+$/, ""));
+        line = line.slice(spaceAt) + char;
+      } else {
+        // A line ending exactly on a space must not keep it, or centred and
+        // right-aligned lines sit one space-width off.
+        lines.push(line.replace(/\s+$/, ""));
+        line = char;
+      }
+      width = 0;
+      Array.from(line).forEach((item) => { width += measuredCharWidth(font, item, size); });
+      spaceAt = -1;
+    } else {
+      line += char;
+      width += charWidth;
+    }
+    if (char === " ") spaceAt = line.length;
+  });
+  lines.push(line.replace(/\s+$/, ""));
+  return lines;
+}
+
+// Explicit newlines always split (a merge rule can produce them); box-width
+// wrapping only happens when the field asks for it.
+function layoutTextLines(text, font, size, maxWidth, wrap) {
+  const paragraphs = String(text ?? "").split("\n");
+  if (!wrap) return paragraphs;
+  const out = [];
+  paragraphs.forEach((paragraph) => {
+    wrapTextToWidth(paragraph, font, size, maxWidth).forEach((line) => out.push(line));
+  });
+  return out;
+}
+
+// --- Codabar / NW-7 ---------------------------------------------------------
+// Seven elements per character, bar first, alternating: "1" is a wide element and
+// "0" a narrow one. Codabar carries only these sixteen data characters plus one
+// of A-D at each end as start/stop -- there is no way to encode arbitrary text,
+// so anything else is rejected rather than drawn as an unscannable barcode.
+//
+// VERIFY WITH A SCANNER before production use.
+const CODABAR_PATTERNS = {
+  "0": "0000011", "1": "0000110", "2": "0001001", "3": "1100000",
+  "4": "0010010", "5": "1000010", "6": "0100001", "7": "0100100",
+  "8": "0110000", "9": "1001000", "-": "0001100", "$": "0011000",
+  ":": "1000101", "/": "1010001", ".": "1010100", "+": "0010101",
+  "A": "0011010", "B": "0101001", "C": "0001011", "D": "0001110",
+};
+const CODABAR_START_STOP = new Set(["A", "B", "C", "D"]);
+const CODABAR_WIDE_RATIO = 2;
+
+// Accepts either form: a value that already brings its own A-D guards, or bare
+// data that gets wrapped with the pair configured on the field. That way one CSV
+// column can feed both the barcode and the places the number prints as text.
+function prepareCodabarValue(raw, startStop = "A") {
+  const text = String(raw ?? "").trim().toUpperCase();
+  if (!text) return { ok: false, chars: [], error: "empty" };
+  const pair = CODABAR_START_STOP.has(String(startStop ?? "A").toUpperCase())
+    ? String(startStop).toUpperCase()
+    : "A";
+  const ownGuards = text.length >= 3
+    && CODABAR_START_STOP.has(text[0])
+    && CODABAR_START_STOP.has(text[text.length - 1]);
+  const chars = ownGuards ? Array.from(text) : [pair, ...Array.from(text), pair];
+  const body = chars.slice(1, -1);
+  if (!body.length) return { ok: false, chars: [], error: "empty" };
+  if (body.some((char) => CODABAR_START_STOP.has(char) || !CODABAR_PATTERNS[char])) {
+    return { ok: false, chars: [], error: "charset" };
+  }
+  return { ok: true, chars, error: "" };
+}
+
+function codabarModules(chars) {
+  const modules = [];
+  chars.forEach((char, index) => {
+    const pattern = CODABAR_PATTERNS[char];
+    if (!pattern) return;
+    Array.from(pattern).forEach((flag, position) => {
+      modules.push({ bar: position % 2 === 0, units: flag === "1" ? CODABAR_WIDE_RATIO : 1 });
+    });
+    if (index < chars.length - 1) modules.push({ bar: false, units: 1 });
+  });
+  return modules;
+}
+
+// Bars fill the field box exactly, so size the box to the bars and leave the
+// quiet zone as white space on the form around it.
+function drawCodabarBarcode(page, box, value, startStop, color) {
+  const prepared = prepareCodabarValue(value, startStop);
+  if (!prepared.ok) return prepared;
+  if (!(box.width > 0) || !(box.height > 0)) return { ok: false, chars: [], error: "geometry" };
+  const modules = codabarModules(prepared.chars);
+  const totalUnits = modules.reduce((sum, module) => sum + module.units, 0);
+  if (!(totalUnits > 0)) return { ok: false, chars: [], error: "geometry" };
+  const unitWidth = box.width / totalUnits;
+  let cursor = box.x;
+  modules.forEach((module) => {
+    const width = module.units * unitWidth;
+    if (module.bar) {
+      page.drawRectangle({ x: cursor, y: box.y, width, height: box.height, color });
+    }
+    cursor += width;
+  });
+  return { ok: true, chars: prepared.chars, error: "", moduleWidth: unitWidth };
 }
 
 function hexToRgb(hex) {

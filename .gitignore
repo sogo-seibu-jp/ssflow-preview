@@ -9,3 +9,7 @@ npm-debug.log*
 *.pdf
 *.txt
 *.md
+Claude outputs/
+*.pptx
+*.xlsx
+*.printtpl
